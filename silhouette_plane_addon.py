@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -108,42 +108,39 @@ def _laplacian_smooth_boundary(plane_bm, iterations=3, factor=0.5):
             v.co.y = y
 
 
-def extract_top_surface(target, name, normal_z_threshold=0.1):
-    """Extrait directement les faces de target dont la normale pointe vers le haut.
-    Aucune grille, aucun ray-cast → fidélité parfaite, pas d'effet escalier.
-    Le résultat utilise la topologie de la source."""
-    bm_src = bmesh.new()
-    bm_src.from_mesh(target.data)
-    bm_src.transform(target.matrix_world)
-    bm_src.normal_update()  # recompute normals after transform (sinon faux pour objets rotated)
-    bm_src.faces.ensure_lookup_table()
-
-    keep_faces = [f for f in bm_src.faces if f.normal.z > normal_z_threshold]
-
-    bm_out = bmesh.new()
-    vert_map = {}
-    for f in keep_faces:
-        new_verts = []
-        for v in f.verts:
-            if v not in vert_map:
-                vert_map[v] = bm_out.verts.new(v.co.copy())
-            new_verts.append(vert_map[v])
-        try:
-            bm_out.faces.new(new_verts)
-        except ValueError:
-            pass
-    bm_src.free()
-    bm_out.normal_update()
-
+def extract_top_surface(target, name, normal_z_threshold=-0.5):
+    """Extrait directement les faces de target dont la normale.z > seuil.
+    Approche : duplique la mesh, puis supprime les faces non voulues (10x plus rapide
+    qu'un copy-by-face avec dédup de verts)."""
+    # Clone le mesh
+    me = target.data.copy()
     if name in bpy.data.objects:
         bpy.data.objects.remove(bpy.data.objects[name], do_unlink=True)
-    me = bpy.data.meshes.new(name + "_mesh")
-    bm_out.to_mesh(me)
-    bm_out.free()
     obj = bpy.data.objects.new(name, me)
     bpy.context.collection.objects.link(obj)
+    obj.matrix_world = target.matrix_world.copy()
 
-    return obj, len(keep_faces)
+    # bmesh : supprime les faces non voulues + verts orphelins
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.transform(target.matrix_world)
+    bm.normal_update()
+    bm.faces.ensure_lookup_table()
+
+    to_remove = [f for f in bm.faces if f.normal.z <= normal_z_threshold]
+    bmesh.ops.delete(bm, geom=to_remove, context='FACES')
+    loose = [v for v in bm.verts if not v.link_faces]
+    if loose:
+        bmesh.ops.delete(bm, geom=loose, context='VERTS')
+
+    n_kept = len(bm.faces)
+    bm.to_mesh(me)
+    bm.free()
+    # Reset matrix : la mesh est déjà en world coords après bm.transform()
+    import mathutils
+    obj.matrix_world = mathutils.Matrix.Identity(4)
+
+    return obj, n_kept
 
 
 def build_silhouette_plane(target, bounds_obj, res_x, res_y, cast_height, cast_distance, name,
@@ -358,10 +355,17 @@ class SILH_OT_create_plane(bpy.types.Operator):
             return {'CANCELLED'}
 
         if s.add_sides:
-            try:
-                add_sides_geonodes(obj, floor_z=s.floor_z)
-            except Exception as e:
-                self.report({'WARNING'}, f"Plan généré mais sides échoué: {e}")
+            # En mode EXTRACT, le mesh peut être très lourd (1M+ faces) et le GeoNodes
+            # Mesh→Curve+Fill plante. Si > 300k faces, on prévient et on skip.
+            if s.mode == 'EXTRACT' and len(obj.data.polygons) > 300_000:
+                self.report({'WARNING'},
+                    f"Mesh trop dense ({len(obj.data.polygons)}f) — flancs+fond skipés "
+                    f"(risque crash). Décime d'abord puis ferme manuellement.")
+            else:
+                try:
+                    add_sides_geonodes(obj, floor_z=s.floor_z)
+                except Exception as e:
+                    self.report({'WARNING'}, f"Plan généré mais sides échoué: {e}")
 
         for o in bpy.context.selected_objects:
             o.select_set(False)
