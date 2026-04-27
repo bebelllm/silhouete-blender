@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 10, 1),
+    "version": (1, 10, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -939,8 +939,8 @@ class SILH_settings(bpy.types.PropertyGroup):
     )
     do_select_interior: BoolProperty(
         name="Select Interior Faces + Delete",
-        default=True,
-        description="Étape 'select_interior_faces' Blender natif après merge — supprime les faces internes détectables.",
+        default=False,
+        description="⚠ ATTENTION : peut massacrer le mesh ! L'algo Blender natif select_interior_faces détecte parfois trop ou trop peu selon la structure. Sur produit.001 il retournait 0 (safe), sur produit_test+BASIFY il supprimait 737k faces (catastrophe). Active uniquement si tu sais ce que tu fais.",
     )
     do_voxel_remesh: BoolProperty(
         name="Voxel Remesh final",
