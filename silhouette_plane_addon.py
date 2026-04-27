@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 10, 0),
+    "version": (1, 10, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -309,12 +309,17 @@ def bake_clean_remesh(target, name, voxel_size=0.005, merge_threshold=0.0001,
                 elif item.name == 'INCLUDE_BOTTOM':
                     m_temp[item.identifier] = True
         temp_mod_added = True
+        # Forcer la mise à jour du depsgraph pour que le nouveau modif soit pris en compte
+        target.update_tag()
+        bpy.context.view_layer.update()
+        print(f"[BAKE_REMESH] BASIFY ajouté temporairement à {target.name} (thickness={basify_thickness})")
 
     try:
-        # 2. Dup avec modificateurs appliqués
+        # 2. Dup avec modificateurs appliqués (depsgraph récupéré après update)
         deps = bpy.context.evaluated_depsgraph_get()
         ev = target.evaluated_get(deps)
         me = bpy.data.meshes.new_from_object(ev, depsgraph=deps)
+        print(f"[BAKE_REMESH] Mesh évalué: {len(me.vertices):,}v {len(me.polygons):,}f")
     finally:
         # Retirer le modif temporaire de la cible originale
         if temp_mod_added:
