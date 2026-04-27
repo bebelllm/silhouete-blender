@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 8, 0),
+    "version": (1, 8, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -232,14 +232,14 @@ def _filter_exterior_faces_by_raycast(bm, escape_distance=100.0):
 
 def bake_clean_remesh(target, name, voxel_size=0.003, merge_threshold=0.0001,
                        fix_poles=True, preserve_volume=True,
-                       smooth_shading=False):
+                       smooth_shading=False, close_bottom=True, floor_z=0.0):
     """Pipeline 'mesh propre fermé' :
     1. Duplique le target avec modificateurs appliqués (mesh évalué)
     2. Merge by Distance pour éliminer les doublons exacts
-    3. Voxel Remesh → shell extérieur manifold sans intérieur
-    Ce workflow exploite le fait que merge supprime les faces superposées qui
-    autrement saturent le voxel grid. Validé sur meshes BASIFY bas-relief."""
-    # 1. Dup avec modificateurs
+    3. (optionnel) Ferme le fond : extrude boundaries vers floor_z + triangle_fill
+    4. Voxel Remesh → shell extérieur manifold sans intérieur
+    Le close_bottom est essentiel si le mesh source a le dessous ouvert,
+    sinon le voxel remesh reproduit le shell ouvert."""
     deps = bpy.context.evaluated_depsgraph_get()
     ev = target.evaluated_get(deps)
     me = bpy.data.meshes.new_from_object(ev, depsgraph=deps)
@@ -254,7 +254,7 @@ def bake_clean_remesh(target, name, voxel_size=0.003, merge_threshold=0.0001,
     for o in bpy.context.selected_objects: o.select_set(False)
     obj.select_set(True)
 
-    # 2. Edit mode → Merge by Distance
+    # Merge by Distance
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.mesh.remove_doubles(threshold=merge_threshold)
@@ -262,7 +262,12 @@ def bake_clean_remesh(target, name, voxel_size=0.003, merge_threshold=0.0001,
 
     n_after_merge = len(obj.data.vertices)
 
-    # 3. Voxel Remesh
+    # Fermer le fond AVANT remesh (sinon remesh garde l'ouverture)
+    n_filled = 0
+    if close_bottom:
+        n_filled = add_sides_bmesh(obj, floor_z=floor_z)
+
+    # Voxel Remesh
     obj.data.remesh_voxel_size = voxel_size
     obj.data.use_remesh_fix_poles = fix_poles
     obj.data.use_remesh_preserve_volume = preserve_volume
@@ -272,7 +277,7 @@ def bake_clean_remesh(target, name, voxel_size=0.003, merge_threshold=0.0001,
         for f in obj.data.polygons:
             f.use_smooth = True
 
-    return obj, n_after_merge
+    return obj, n_after_merge, n_filled
 
 
 def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=True,
@@ -726,7 +731,7 @@ class SILH_OT_create_plane(bpy.types.Operator):
                 if s.exterior_only or s.topmost_only:
                     msg_extra += f", {n_interior} enfouies supprimées"
             elif s.mode == 'BAKE_REMESH':
-                obj, n_merged = bake_clean_remesh(
+                obj, n_merged, n_filled = bake_clean_remesh(
                     target=s.target,
                     name=s.output_name,
                     voxel_size=s.voxel_size,
@@ -734,8 +739,10 @@ class SILH_OT_create_plane(bpy.types.Operator):
                     fix_poles=s.remesh_fix_poles,
                     preserve_volume=s.remesh_preserve_volume,
                     smooth_shading=s.smooth_shading,
+                    close_bottom=s.bake_close_bottom,
+                    floor_z=s.floor_z,
                 )
-                msg_extra = f"merge → {n_merged}v, remesh voxel {s.voxel_size}m → {len(obj.data.vertices)}v {len(obj.data.polygons)}f"
+                msg_extra = f"merge → {n_merged}v, fond fermé ({n_filled}f), remesh → {len(obj.data.vertices)}v {len(obj.data.polygons)}f"
             elif s.mode == 'MULTIDIR':
                 obj, n_v, n_f = build_multidir_silhouette(
                     target=s.target,
@@ -817,6 +824,11 @@ class SILH_settings(bpy.types.PropertyGroup):
     voxel_size: FloatProperty(
         name="Voxel size", default=0.005, min=0.001, max=1.0, precision=4,
         description="Taille du voxel pour le remesh. Plus petit = plus précis mais plus lourd. 0.005 = 5mm (sûr). <0.003 risque de freezer Blender sur grands meshes (3m×1.5m).",
+    )
+    bake_close_bottom: BoolProperty(
+        name="Fermer le fond avant remesh",
+        default=True,
+        description="Extrude les boundaries vers Floor Z et triangule, AVANT le voxel remesh. Indispensable si le mesh source a le dessous ouvert (sinon le remesh reproduit l'ouverture).",
     )
     remesh_fix_poles: BoolProperty(
         name="Fix Poles", default=True,
@@ -955,6 +967,9 @@ class SILH_PT_panel(bpy.types.Panel):
             box.label(text="Bake & Voxel Remesh")
             box.prop(s, "voxel_size")
             box.prop(s, "merge_threshold")
+            box.prop(s, "bake_close_bottom")
+            sub = box.row(); sub.enabled = s.bake_close_bottom
+            sub.prop(s, "floor_z")
             box.prop(s, "remesh_fix_poles")
             box.prop(s, "remesh_preserve_volume")
             box.prop(s, "smooth_shading")
