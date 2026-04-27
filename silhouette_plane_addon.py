@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 7, 0),
+    "version": (1, 8, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -108,6 +108,76 @@ def _laplacian_smooth_boundary(plane_bm, iterations=3, factor=0.5):
             v.co.y = y
 
 
+def _filter_interior_via_blender_op(obj):
+    """Utilise l'opérateur natif Blender select_interior_faces() pour détecter les faces enfouies.
+    Retourne le nombre de faces supprimées."""
+    bpy.context.view_layer.objects.active = obj
+    for o in bpy.context.selected_objects: o.select_set(False)
+    obj.select_set(True)
+
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='DESELECT')
+    bpy.ops.mesh.select_mode(type='FACE')
+    bpy.ops.mesh.select_interior_faces()
+    # Compter les sélectionnés
+    n = sum(1 for f in obj.data.polygons if f.select)
+    bpy.ops.mesh.delete(type='FACE')
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return n
+
+
+def _filter_visibility_multi_direction(bm, n_directions=8, escape_distance=100.0):
+    """Pour chaque face, lance n_directions rayons depuis center+epsilon*normal vers diverses directions
+    distribuées dans l'hémisphère. Si AUCUN rayon ne s'échappe → face complètement enfermée."""
+    import math, random
+    bvh = BVHTree.FromBMesh(bm)
+    bm.faces.ensure_lookup_table()
+
+    # Directions distribuées sur la demi-sphère
+    base_dirs = []
+    for k in range(n_directions):
+        # Fibonacci sphere demi-haut
+        phi = math.acos(1 - (k + 0.5) / n_directions)
+        theta = math.pi * (1 + 5**0.5) * k
+        x = math.sin(phi) * math.cos(theta)
+        y = math.sin(phi) * math.sin(theta)
+        z = math.cos(phi)
+        base_dirs.append(Vector((x, y, z)))
+
+    eps = 0.0001
+    interior = []
+    for f in bm.faces:
+        c = f.calc_center_median()
+        n = f.normal
+        if n.length < 1e-6:
+            continue
+        origin = c + n * eps
+        # Aligner les directions sur l'hémisphère de la normale (axe Z local = n)
+        # Trouver un axe perpendiculaire
+        if abs(n.z) < 0.9:
+            tx = n.cross(Vector((0,0,1))).normalized()
+        else:
+            tx = n.cross(Vector((1,0,0))).normalized()
+        ty = n.cross(tx).normalized()
+
+        any_escape = False
+        for d in base_dirs:
+            world_dir = (tx * d.x + ty * d.y + n * d.z).normalized()
+            loc, _, idx, _ = bvh.ray_cast(origin, world_dir, escape_distance)
+            if loc is None or idx == f.index:
+                any_escape = True
+                break
+        if not any_escape:
+            interior.append(f)
+
+    if interior:
+        bmesh.ops.delete(bm, geom=interior, context='FACES')
+        loose = [v for v in bm.verts if not v.link_faces]
+        if loose:
+            bmesh.ops.delete(bm, geom=loose, context='VERTS')
+    return len(interior)
+
+
 def _filter_topmost_faces(bm, ray_height=10.0):
     """Pour chaque face, lance un rayon vertical descendant depuis ray_height au-dessus de son centre.
     Garde la face SEULEMENT si elle est la première touchée par ce rayon (= visible du dessus).
@@ -133,14 +203,14 @@ def _filter_topmost_faces(bm, ray_height=10.0):
     return len(not_topmost)
 
 
-def _filter_exterior_faces_by_raycast(bm, escape_distance=0.005):
-    """Pour chaque face, ray-cast depuis center+epsilon*normal dans la direction de la normale.
-    Si le rayon s'échappe (rien à escape_distance) → face extérieure (gardée).
-    Si le rayon tape immédiatement autre chose → face enfouie/intérieure (supprimée)."""
+def _filter_exterior_faces_by_raycast(bm, escape_distance=100.0):
+    """Pour chaque face, ray-cast depuis center+epsilon*normal dans la direction de la normale,
+    avec une très grande distance (= test infini en pratique).
+    Si le rayon s'échappe → face extérieure (gardée). S'il tape n'importe quelle autre face → enfouie."""
     bvh = BVHTree.FromBMesh(bm)
     bm.faces.ensure_lookup_table()
 
-    eps = 0.0001  # offset pour éviter le self-hit
+    eps = 0.0001
     interior = []
     for f in bm.faces:
         center = f.calc_center_median()
@@ -149,7 +219,6 @@ def _filter_exterior_faces_by_raycast(bm, escape_distance=0.005):
             continue
         origin = center + n * eps
         loc, hit_n, idx, dist = bvh.ray_cast(origin, n, escape_distance)
-        # Si on tape quelque chose dans escape_distance ET que ce n'est pas la face elle-même
         if loc is not None and idx != f.index:
             interior.append(f)
 
@@ -159,6 +228,51 @@ def _filter_exterior_faces_by_raycast(bm, escape_distance=0.005):
         if loose:
             bmesh.ops.delete(bm, geom=loose, context='VERTS')
     return len(interior)
+
+
+def bake_clean_remesh(target, name, voxel_size=0.003, merge_threshold=0.0001,
+                       fix_poles=True, preserve_volume=True,
+                       smooth_shading=False):
+    """Pipeline 'mesh propre fermé' :
+    1. Duplique le target avec modificateurs appliqués (mesh évalué)
+    2. Merge by Distance pour éliminer les doublons exacts
+    3. Voxel Remesh → shell extérieur manifold sans intérieur
+    Ce workflow exploite le fait que merge supprime les faces superposées qui
+    autrement saturent le voxel grid. Validé sur meshes BASIFY bas-relief."""
+    # 1. Dup avec modificateurs
+    deps = bpy.context.evaluated_depsgraph_get()
+    ev = target.evaluated_get(deps)
+    me = bpy.data.meshes.new_from_object(ev, depsgraph=deps)
+
+    if name in bpy.data.objects:
+        bpy.data.objects.remove(bpy.data.objects[name], do_unlink=True)
+    obj = bpy.data.objects.new(name, me)
+    bpy.context.collection.objects.link(obj)
+    obj.matrix_world = target.matrix_world.copy()
+
+    bpy.context.view_layer.objects.active = obj
+    for o in bpy.context.selected_objects: o.select_set(False)
+    obj.select_set(True)
+
+    # 2. Edit mode → Merge by Distance
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.remove_doubles(threshold=merge_threshold)
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    n_after_merge = len(obj.data.vertices)
+
+    # 3. Voxel Remesh
+    obj.data.remesh_voxel_size = voxel_size
+    obj.data.use_remesh_fix_poles = fix_poles
+    obj.data.use_remesh_preserve_volume = preserve_volume
+    bpy.ops.object.voxel_remesh()
+
+    if smooth_shading:
+        for f in obj.data.polygons:
+            f.use_smooth = True
+
+    return obj, n_after_merge
 
 
 def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=True,
@@ -611,6 +725,17 @@ class SILH_OT_create_plane(bpy.types.Operator):
                 msg_extra = f"{n_faces} faces extraites"
                 if s.exterior_only or s.topmost_only:
                     msg_extra += f", {n_interior} enfouies supprimées"
+            elif s.mode == 'BAKE_REMESH':
+                obj, n_merged = bake_clean_remesh(
+                    target=s.target,
+                    name=s.output_name,
+                    voxel_size=s.voxel_size,
+                    merge_threshold=s.merge_threshold,
+                    fix_poles=s.remesh_fix_poles,
+                    preserve_volume=s.remesh_preserve_volume,
+                    smooth_shading=s.smooth_shading,
+                )
+                msg_extra = f"merge → {n_merged}v, remesh voxel {s.voxel_size}m → {len(obj.data.vertices)}v {len(obj.data.polygons)}f"
             elif s.mode == 'MULTIDIR':
                 obj, n_v, n_f = build_multidir_silhouette(
                     target=s.target,
@@ -684,9 +809,26 @@ class SILH_settings(bpy.types.PropertyGroup):
             ('RAYCAST', "Ray-cast top", "Grille du haut + ray-cast vertical (top seulement)"),
             ('MULTIDIR', "Ray-cast multi-direction", "Ray-cast depuis le haut + 4 côtés (top + flancs, capture la peau extérieure complète)"),
             ('EXTRACT', "Extraire surface source", "Copie directe des faces de la cible (fidélité parfaite, hérite topologie source, peut garder des faces enfouies)"),
+            ('BAKE_REMESH', "Bake & Voxel Remesh", "Applique modificateurs + Merge by Distance + Voxel Remesh. Donne un shell extérieur manifold propre. Idéal après BASIFY MAKE MANIFOLD."),
         ],
         default='RAYCAST',
         description="Méthode de génération du plan",
+    )
+    voxel_size: FloatProperty(
+        name="Voxel size", default=0.005, min=0.001, max=1.0, precision=4,
+        description="Taille du voxel pour le remesh. Plus petit = plus précis mais plus lourd. 0.005 = 5mm (sûr). <0.003 risque de freezer Blender sur grands meshes (3m×1.5m).",
+    )
+    remesh_fix_poles: BoolProperty(
+        name="Fix Poles", default=True,
+        description="Corrige les pôles dans la topo voxel remesh",
+    )
+    remesh_preserve_volume: BoolProperty(
+        name="Preserve Volume", default=True,
+        description="Conserve le volume original (compense le shrink du voxel grid)",
+    )
+    smooth_shading: BoolProperty(
+        name="Smooth Shading", default=False,
+        description="Active shade smooth sur les faces du résultat",
     )
     res_side: IntProperty(
         name="Résolution flancs", default=400, min=10, max=4000,
@@ -808,7 +950,17 @@ class SILH_PT_panel(bpy.types.Panel):
         box.label(text="Cible")
         box.prop(s, "target", text="")
 
-        if s.mode == 'EXTRACT':
+        if s.mode == 'BAKE_REMESH':
+            box = layout.box()
+            box.label(text="Bake & Voxel Remesh")
+            box.prop(s, "voxel_size")
+            box.prop(s, "merge_threshold")
+            box.prop(s, "remesh_fix_poles")
+            box.prop(s, "remesh_preserve_volume")
+            box.prop(s, "smooth_shading")
+            box.label(text="Shell extérieur manifold garanti", icon='CHECKMARK')
+            box.label(text="Voxel <0.002 risque crash sur gros mesh", icon='ERROR')
+        elif s.mode == 'EXTRACT':
             box = layout.box()
             box.label(text="Extraction directe")
             box.prop(s, "normal_z_threshold")
