@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 10, 2),
+    "version": (1, 11, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -286,7 +286,9 @@ def bake_clean_remesh(target, name, voxel_size=0.005, merge_threshold=0.0001,
                        fix_poles=True, preserve_volume=True,
                        smooth_shading=False,
                        auto_add_basify=True, basify_thickness=0.005,
-                       do_select_interior=True, do_voxel_remesh=True):
+                       do_select_interior=True, do_voxel_remesh=True,
+                       do_remove_interior_gn=False, rmi_ray_distance=100.0,
+                       rmi_offset_epsilon=0.0001):
     """Reproduit le pipeline manuel qui a donné produit_baked_clean :
     1. (optionnel) Ajoute BASIFY_MOD_MAKE_MANIFOLD si présent dans .blend et pas déjà sur target
     2. Duplique avec modificateurs appliqués (mesh évalué)
@@ -356,7 +358,12 @@ def bake_clean_remesh(target, name, voxel_size=0.005, merge_threshold=0.0001,
             bpy.ops.mesh.delete(type='FACE')
         bpy.ops.object.mode_set(mode='OBJECT')
 
-    # 5. Voxel Remesh (optionnel)
+    # 5. Vider l'intérieur via GN ray-cast (préserve parois extérieures)
+    if do_remove_interior_gn:
+        add_remove_interior_modifier(obj, ray_distance=rmi_ray_distance,
+                                     offset_epsilon=rmi_offset_epsilon)
+
+    # 6. Voxel Remesh (optionnel)
     if do_voxel_remesh:
         obj.data.remesh_voxel_size = voxel_size
         obj.data.use_remesh_fix_poles = fix_poles
@@ -653,6 +660,79 @@ def build_silhouette_plane(target, bounds_obj, res_x, res_y, cast_height, cast_d
     return obj, snapped, border_snapped
 
 
+def get_or_create_remove_interior_nodegroup():
+    """Crée (ou retourne) un node group GeoNodes qui supprime les faces enfouies via ray-cast.
+    Pour chaque face, lance un rayon dans la direction de sa normale. Si le rayon tape
+    une autre face dans la limite de distance → face intérieure → supprimée.
+    Préserve les parois extérieures à l'identique (ne modifie pas la position des verts)."""
+    name = "GN_RemoveInteriorByRaycast"
+    if name in bpy.data.node_groups:
+        return bpy.data.node_groups[name]
+
+    ng = bpy.data.node_groups.new(name, "GeometryNodeTree")
+    ng.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    ng.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    ng.interface.new_socket(name="Ray Distance", in_out='INPUT', socket_type='NodeSocketFloat')
+    ng.interface.new_socket(name="Offset Epsilon", in_out='INPUT', socket_type='NodeSocketFloat')
+
+    nodes = ng.nodes; links = ng.links
+
+    n_in = nodes.new("NodeGroupInput"); n_in.location = (-1200, 0)
+    n_out = nodes.new("NodeGroupOutput"); n_out.location = (800, 0)
+
+    # Position et Normal au niveau face
+    pos = nodes.new("GeometryNodeInputPosition"); pos.location = (-1000, -200)
+    nor = nodes.new("GeometryNodeInputNormal"); nor.location = (-1000, -350)
+
+    # Mettre la position au centre de la face : Field on Domain (Face)
+    # Position est par défaut au vertex ; pour avoir centre face on évalue au domaine FACE
+    # Le node Raycast accepte une "Source Position" qui peut être un field
+
+    # Origine = position + epsilon * normale
+    mul = nodes.new("ShaderNodeVectorMath"); mul.location = (-800, -350)
+    mul.operation = 'SCALE'
+    links.new(nor.outputs["Normal"], mul.inputs[0])
+    links.new(n_in.outputs["Offset Epsilon"], mul.inputs["Scale"])
+
+    add = nodes.new("ShaderNodeVectorMath"); add.location = (-600, -250)
+    add.operation = 'ADD'
+    links.new(pos.outputs["Position"], add.inputs[0])
+    links.new(mul.outputs[0], add.inputs[1])
+
+    # Raycast : tape la même geometry depuis origin dans la direction normal
+    raycast = nodes.new("GeometryNodeRaycast"); raycast.location = (-300, 0)
+    raycast.data_type = 'FLOAT'
+    links.new(n_in.outputs["Geometry"], raycast.inputs["Target Geometry"])
+    links.new(add.outputs[0], raycast.inputs["Source Position"])
+    links.new(nor.outputs["Normal"], raycast.inputs["Ray Direction"])
+    links.new(n_in.outputs["Ray Distance"], raycast.inputs["Ray Length"])
+
+    # Delete Geometry où Is Hit == True (= face avec quelque chose devant elle = enfouie)
+    dg = nodes.new("GeometryNodeDeleteGeometry"); dg.location = (300, 0)
+    dg.domain = 'FACE'
+    dg.mode = 'ALL'
+    links.new(n_in.outputs["Geometry"], dg.inputs["Geometry"])
+    links.new(raycast.outputs["Is Hit"], dg.inputs["Selection"])
+
+    links.new(dg.outputs["Geometry"], n_out.inputs["Geometry"])
+
+    return ng
+
+
+def add_remove_interior_modifier(obj, ray_distance=100.0, offset_epsilon=0.0001):
+    """Ajoute le modificateur GeoNodes 'GN_RemoveInteriorByRaycast' à l'objet."""
+    ng = get_or_create_remove_interior_nodegroup()
+    mod = obj.modifiers.new(name="RemoveInterior", type='NODES')
+    mod.node_group = ng
+    for item in ng.interface.items_tree:
+        if hasattr(item, 'in_out') and item.in_out == 'INPUT':
+            if item.name == 'Ray Distance':
+                mod[item.identifier] = ray_distance
+            elif item.name == 'Offset Epsilon':
+                mod[item.identifier] = offset_epsilon
+    return mod
+
+
 def add_sides_bmesh(obj, floor_z=0.0):
     """Ferme le mesh en pur bmesh : extrude boundary edges vers floor_z + remplit le fond.
     Beaucoup plus rapide que la version GeoNodes (pas de Mesh→Curve+Fill Curve)."""
@@ -842,6 +922,9 @@ class SILH_OT_create_plane(bpy.types.Operator):
                     basify_thickness=s.basify_thickness,
                     do_select_interior=s.do_select_interior,
                     do_voxel_remesh=s.do_voxel_remesh,
+                    do_remove_interior_gn=s.do_remove_interior_gn,
+                    rmi_ray_distance=s.rmi_ray_distance,
+                    rmi_offset_epsilon=s.rmi_offset_epsilon,
                 )
                 msg_extra = f"start {n_init}v → merge {n_merged}v → interior -{n_int}f → final {len(obj.data.vertices)}v {len(obj.data.polygons)}f"
             elif s.mode == 'MULTIDIR':
@@ -941,6 +1024,21 @@ class SILH_settings(bpy.types.PropertyGroup):
         name="Select Interior Faces + Delete",
         default=False,
         description="⚠ ATTENTION : peut massacrer le mesh ! L'algo Blender natif select_interior_faces détecte parfois trop ou trop peu selon la structure. Sur produit.001 il retournait 0 (safe), sur produit_test+BASIFY il supprimait 737k faces (catastrophe). Active uniquement si tu sais ce que tu fais.",
+    )
+    do_remove_interior_gn: BoolProperty(
+        name="Vider l'intérieur (ray-cast GN)",
+        default=False,
+        description="Ajoute un modificateur Geometry Nodes qui ray-cast chaque face dans la direction de sa normale. Si la face a quelque chose devant elle, elle est enfouie → supprimée. PRÉSERVE LES PAROIS EXTÉRIEURES (contrairement au voxel remesh). Non-destructif : modificateur ajustable. Reste dans la stack après création.",
+    )
+    rmi_ray_distance: FloatProperty(
+        name="Distance ray-cast",
+        default=100.0, min=0.001, max=1000.0,
+        description="Distance max du rayon. Grande valeur (100m) = test 'infini' qui catche bien les faces enfouies. Trop petite ne catche que les très proches.",
+    )
+    rmi_offset_epsilon: FloatProperty(
+        name="Offset epsilon",
+        default=0.0001, min=0.000001, max=0.01, precision=6,
+        description="Petit décalage de l'origine du rayon le long de la normale (anti self-hit)",
     )
     do_voxel_remesh: BoolProperty(
         name="Voxel Remesh final",
@@ -1097,6 +1195,11 @@ class SILH_PT_panel(bpy.types.Panel):
 
             box.prop(s, "merge_threshold")
             box.prop(s, "do_select_interior")
+
+            box.prop(s, "do_remove_interior_gn")
+            sub = box.column(); sub.enabled = s.do_remove_interior_gn
+            sub.prop(s, "rmi_ray_distance")
+            sub.prop(s, "rmi_offset_epsilon")
 
             box.prop(s, "do_voxel_remesh")
             sub = box.column(); sub.enabled = s.do_voxel_remesh
