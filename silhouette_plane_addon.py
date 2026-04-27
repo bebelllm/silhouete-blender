@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 9, 1),
+    "version": (1, 10, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -228,6 +228,58 @@ def _filter_exterior_faces_by_raycast(bm, escape_distance=100.0):
         if loose:
             bmesh.ops.delete(bm, geom=loose, context='VERTS')
     return len(interior)
+
+
+def join_with_plane(target, plan_obj, name, merge_threshold=0.0001, use_modifiers=True):
+    """Pipeline minimal qui correspond à 'produit_baked_clean' tel que tu le vois :
+    1. Duplique la cible (avec ou sans modificateurs)
+    2. Joint l'objet plan dessous (typiquement plan_sol)
+    3. Merge by Distance pour souder les éventuels doublons
+    Ni plus ni moins."""
+    # 1. Dup target
+    if use_modifiers:
+        deps = bpy.context.evaluated_depsgraph_get()
+        ev = target.evaluated_get(deps)
+        me = bpy.data.meshes.new_from_object(ev, depsgraph=deps)
+    else:
+        me = target.data.copy()
+
+    if name in bpy.data.objects:
+        bpy.data.objects.remove(bpy.data.objects[name], do_unlink=True)
+    obj = bpy.data.objects.new(name, me)
+    bpy.context.collection.objects.link(obj)
+    obj.matrix_world = target.matrix_world.copy()
+    n_initial = len(obj.data.vertices)
+
+    # 2. Dup plan + join
+    if plan_obj is not None:
+        plan_copy = plan_obj.copy()
+        plan_copy.data = plan_obj.data.copy()
+        plan_copy.name = f"_{name}_plan_temp"
+        bpy.context.collection.objects.link(plan_copy)
+        bpy.context.view_layer.objects.active = plan_copy
+        for o in bpy.context.selected_objects: o.select_set(False)
+        plan_copy.select_set(True)
+        try:
+            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        except Exception:
+            pass
+
+        for o in bpy.context.selected_objects: o.select_set(False)
+        plan_copy.select_set(True); obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.join()
+
+    # 3. Merge by distance
+    bpy.context.view_layer.objects.active = obj
+    for o in bpy.context.selected_objects: o.select_set(False)
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.remove_doubles(threshold=merge_threshold)
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    return obj, n_initial, len(obj.data.vertices)
 
 
 def bake_clean_remesh(target, name, voxel_size=0.005, merge_threshold=0.0001,
@@ -763,6 +815,15 @@ class SILH_OT_create_plane(bpy.types.Operator):
                 msg_extra = f"{n_faces} faces extraites"
                 if s.exterior_only or s.topmost_only:
                     msg_extra += f", {n_interior} enfouies supprimées"
+            elif s.mode == 'JOIN_PLANE':
+                obj, n_init, n_final = join_with_plane(
+                    target=s.target,
+                    plan_obj=s.bounds_object,
+                    name=s.output_name,
+                    merge_threshold=s.merge_threshold,
+                    use_modifiers=s.use_modifiers,
+                )
+                msg_extra = f"start {n_init}v + plan → merge → {n_final}v {len(obj.data.polygons)}f"
             elif s.mode == 'BAKE_REMESH':
                 obj, n_init, n_merged, n_int = bake_clean_remesh(
                     target=s.target,
@@ -851,7 +912,8 @@ class SILH_settings(bpy.types.PropertyGroup):
             ('RAYCAST', "Ray-cast top", "Grille du haut + ray-cast vertical (top seulement)"),
             ('MULTIDIR', "Ray-cast multi-direction", "Ray-cast depuis le haut + 4 côtés (top + flancs, capture la peau extérieure complète)"),
             ('EXTRACT', "Extraire surface source", "Copie directe des faces de la cible (fidélité parfaite, hérite topologie source, peut garder des faces enfouies)"),
-            ('BAKE_REMESH', "Bake & Voxel Remesh", "Applique modificateurs + Merge by Distance + Voxel Remesh. Donne un shell extérieur manifold propre. Idéal après BASIFY MAKE MANIFOLD."),
+            ('JOIN_PLANE', "Join avec plan", "Duplique la cible + joint un plan dessous + merge. Simple et minimal, pas de BASIFY, pas de remesh."),
+            ('BAKE_REMESH', "Bake & Voxel Remesh", "Pipeline complet : BASIFY + Apply modifs + Merge + Select Interior + Voxel Remesh."),
         ],
         default='RAYCAST',
         description="Méthode de génération du plan",
@@ -1012,7 +1074,15 @@ class SILH_PT_panel(bpy.types.Panel):
         box.label(text="Cible")
         box.prop(s, "target", text="")
 
-        if s.mode == 'BAKE_REMESH':
+        if s.mode == 'JOIN_PLANE':
+            box = layout.box()
+            box.label(text="Join avec plan (minimal)")
+            box.prop(s, "bounds_object", text="Plan à joindre")
+            box.prop(s, "use_modifiers")
+            box.prop(s, "merge_threshold")
+            box.label(text="Cible (dup) + Plan (dup) + Merge", icon='CHECKMARK')
+            box.label(text="Pas de BASIFY ni de remesh", icon='INFO')
+        elif s.mode == 'BAKE_REMESH':
             box = layout.box()
             box.label(text="Pipeline BASIFY → merge → interior → remesh")
 
