@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 11, 0),
+    "version": (1, 11, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -1283,6 +1283,12 @@ class SILH_PT_panel(bpy.types.Panel):
         layout.prop(s, "output_name")
         layout.operator("object.silhouette_plane_create", icon='MESH_PLANE')
 
+        # Bouton pour créer le node group GN_RemoveInteriorByRaycast manuellement
+        box = layout.box()
+        box.label(text="Outils GeoNodes")
+        box.operator("object.silhouette_create_nodegroup", text="Créer GN_RemoveInteriorByRaycast", icon='NODETREE')
+        box.label(text="À ajouter manuellement comme modif GeoNodes", icon='INFO')
+
 
 # ---------------------------------------------------------------------------
 # Register
@@ -1291,14 +1297,41 @@ class SILH_PT_panel(bpy.types.Panel):
 classes = (SILH_settings, SILH_OT_create_plane, SILH_PT_panel)
 
 
+class SILH_OT_create_nodegroup(bpy.types.Operator):
+    bl_idname = "object.silhouette_create_nodegroup"
+    bl_label = "Créer node group GN_RemoveInteriorByRaycast"
+    bl_description = "Force la création du node group RemoveInteriorByRaycast (utile pour l'utiliser manuellement comme modificateur GeoNodes)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ng = get_or_create_remove_interior_nodegroup()
+        self.report({'INFO'}, f"Node group '{ng.name}' disponible. Ajoute-le comme modificateur GeoNodes manuellement.")
+        return {'FINISHED'}
+
+
+def _ensure_remove_interior_nodegroup_on_load():
+    """Crée le node group si pas déjà présent au chargement de l'addon."""
+    try:
+        get_or_create_remove_interior_nodegroup()
+    except Exception:
+        pass
+
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
+    bpy.utils.register_class(SILH_OT_create_nodegroup)
     bpy.types.Scene.silhouette_settings = PointerProperty(type=SILH_settings)
+    # Création différée du node group (après que les types sont enregistrés)
+    bpy.app.timers.register(_ensure_remove_interior_nodegroup_on_load, first_interval=0.1)
 
 
 def unregister():
     del bpy.types.Scene.silhouette_settings
+    try:
+        bpy.utils.unregister_class(SILH_OT_create_nodegroup)
+    except Exception:
+        pass
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
 
