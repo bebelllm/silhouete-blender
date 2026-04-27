@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -108,10 +108,39 @@ def _laplacian_smooth_boundary(plane_bm, iterations=3, factor=0.5):
             v.co.y = y
 
 
-def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=True):
+def _filter_exterior_faces_by_raycast(bm, escape_distance=0.005):
+    """Pour chaque face, ray-cast depuis center+epsilon*normal dans la direction de la normale.
+    Si le rayon s'échappe (rien à escape_distance) → face extérieure (gardée).
+    Si le rayon tape immédiatement autre chose → face enfouie/intérieure (supprimée)."""
+    bvh = BVHTree.FromBMesh(bm)
+    bm.faces.ensure_lookup_table()
+
+    eps = 0.0001  # offset pour éviter le self-hit
+    interior = []
+    for f in bm.faces:
+        center = f.calc_center_median()
+        n = f.normal
+        if n.length < 1e-6:
+            continue
+        origin = center + n * eps
+        loc, hit_n, idx, dist = bvh.ray_cast(origin, n, escape_distance)
+        # Si on tape quelque chose dans escape_distance ET que ce n'est pas la face elle-même
+        if loc is not None and idx != f.index:
+            interior.append(f)
+
+    if interior:
+        bmesh.ops.delete(bm, geom=interior, context='FACES')
+        loose = [v for v in bm.verts if not v.link_faces]
+        if loose:
+            bmesh.ops.delete(bm, geom=loose, context='VERTS')
+    return len(interior)
+
+
+def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=True,
+                        exterior_only=False, escape_distance=0.005):
     """Extrait directement les faces de target dont la normale.z > seuil.
-    Si use_modifiers=True, utilise le mesh ÉVALUÉ (avec modificateurs appliqués)."""
-    # Récupère le mesh à utiliser
+    Si use_modifiers=True, utilise le mesh ÉVALUÉ (avec modificateurs appliqués).
+    Si exterior_only=True, supprime ensuite les faces enfouies (test ray-cast)."""
     if use_modifiers:
         deps = bpy.context.evaluated_depsgraph_get()
         ev = target.evaluated_get(deps)
@@ -124,27 +153,31 @@ def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=Tru
     obj = bpy.data.objects.new(name, me)
     bpy.context.collection.objects.link(obj)
 
-    # bmesh : supprime les faces non voulues + verts orphelins
     bm = bmesh.new()
     bm.from_mesh(me)
     bm.transform(target.matrix_world)
     bm.normal_update()
     bm.faces.ensure_lookup_table()
 
+    # Filtre 1 : seuil normale Z
     to_remove = [f for f in bm.faces if f.normal.z <= normal_z_threshold]
     bmesh.ops.delete(bm, geom=to_remove, context='FACES')
     loose = [v for v in bm.verts if not v.link_faces]
     if loose:
         bmesh.ops.delete(bm, geom=loose, context='VERTS')
 
+    # Filtre 2 (optionnel) : extérieur seulement via ray-cast
+    n_interior_removed = 0
+    if exterior_only:
+        n_interior_removed = _filter_exterior_faces_by_raycast(bm, escape_distance=escape_distance)
+
     n_kept = len(bm.faces)
     bm.to_mesh(me)
     bm.free()
-    # Reset matrix : la mesh est déjà en world coords après bm.transform()
     import mathutils
     obj.matrix_world = mathutils.Matrix.Identity(4)
 
-    return obj, n_kept
+    return obj, n_kept, n_interior_removed
 
 
 def build_silhouette_plane(target, bounds_obj, res_x, res_y, cast_height, cast_distance, name,
@@ -330,13 +363,17 @@ class SILH_OT_create_plane(bpy.types.Operator):
         try:
             if s.mode == 'EXTRACT':
                 # Extraction directe des faces du dessus de la cible (fidélité max, zéro escalier)
-                obj, n_faces = extract_top_surface(
+                obj, n_faces, n_interior = extract_top_surface(
                     target=s.target,
                     name=s.output_name,
                     normal_z_threshold=s.normal_z_threshold,
                     use_modifiers=s.use_modifiers,
+                    exterior_only=s.exterior_only,
+                    escape_distance=s.escape_distance,
                 )
                 msg_extra = f"{n_faces} faces extraites"
+                if s.exterior_only:
+                    msg_extra += f", {n_interior} intérieures supprimées"
             else:
                 # Mode RAYCAST : grille + ray-cast
                 obj, hits, border_snapped = build_silhouette_plane(
@@ -408,6 +445,16 @@ class SILH_settings(bpy.types.PropertyGroup):
         name="Avec modificateurs",
         default=True,
         description="Utilise le mesh évalué (avec modificateurs appliqués) plutôt que le mesh source brut. Important si la cible a Solidify, Subsurf, BASIFY, etc.",
+    )
+    exterior_only: BoolProperty(
+        name="Extérieur seulement",
+        default=False,
+        description="Supprime les faces enfouies (intérieures aux coquilles superposées) via ray-cast. Plus lent mais propre sur les meshes avec shells doublés.",
+    )
+    escape_distance: FloatProperty(
+        name="Distance test",
+        default=0.005, min=0.0001, max=1.0, precision=4,
+        description="Distance max du ray-cast pour décider si une face est intérieure. Augmenter si shells très proches, diminuer si fines feuilles parallèles légitimes.",
     )
     target: PointerProperty(
         name="Cible",
@@ -494,6 +541,10 @@ class SILH_PT_panel(bpy.types.Panel):
             box.label(text="Extraction directe")
             box.prop(s, "normal_z_threshold")
             box.prop(s, "use_modifiers")
+            box.prop(s, "exterior_only")
+            sub = box.row()
+            sub.enabled = s.exterior_only
+            sub.prop(s, "escape_distance")
             box.label(text="Aucune approximation, fidélité parfaite", icon='CHECKMARK')
             box.label(text="Topologie héritée de la source", icon='ERROR')
         else:
