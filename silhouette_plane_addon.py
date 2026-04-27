@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -108,6 +108,31 @@ def _laplacian_smooth_boundary(plane_bm, iterations=3, factor=0.5):
             v.co.y = y
 
 
+def _filter_topmost_faces(bm, ray_height=10.0):
+    """Pour chaque face, lance un rayon vertical descendant depuis ray_height au-dessus de son centre.
+    Garde la face SEULEMENT si elle est la première touchée par ce rayon (= visible du dessus).
+    Élimine toutes les couches enfouies sous d'autres surfaces."""
+    bvh = BVHTree.FromBMesh(bm)
+    bm.faces.ensure_lookup_table()
+
+    direction = Vector((0, 0, -1))
+    not_topmost = []
+    for f in bm.faces:
+        c = f.calc_center_median()
+        origin = Vector((c.x, c.y, ray_height))
+        loc, hn, hit_idx, dist = bvh.ray_cast(origin, direction, ray_height + 100.0)
+        # Si la première face touchée n'est pas celle-ci → enfouie
+        if hit_idx is not None and hit_idx != f.index:
+            not_topmost.append(f)
+
+    if not_topmost:
+        bmesh.ops.delete(bm, geom=not_topmost, context='FACES')
+        loose = [v for v in bm.verts if not v.link_faces]
+        if loose:
+            bmesh.ops.delete(bm, geom=loose, context='VERTS')
+    return len(not_topmost)
+
+
 def _filter_exterior_faces_by_raycast(bm, escape_distance=0.005):
     """Pour chaque face, ray-cast depuis center+epsilon*normal dans la direction de la normale.
     Si le rayon s'échappe (rien à escape_distance) → face extérieure (gardée).
@@ -137,7 +162,8 @@ def _filter_exterior_faces_by_raycast(bm, escape_distance=0.005):
 
 
 def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=True,
-                        exterior_only=False, escape_distance=0.005):
+                        exterior_only=False, escape_distance=0.005,
+                        topmost_only=False, ray_height=10.0):
     """Extrait directement les faces de target dont la normale.z > seuil.
     Si use_modifiers=True, utilise le mesh ÉVALUÉ (avec modificateurs appliqués).
     Si exterior_only=True, supprime ensuite les faces enfouies (test ray-cast)."""
@@ -170,6 +196,11 @@ def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=Tru
     n_interior_removed = 0
     if exterior_only:
         n_interior_removed = _filter_exterior_faces_by_raycast(bm, escape_distance=escape_distance)
+
+    # Filtre 3 (optionnel) : garder uniquement la peau topmost (la plus haute à chaque XY)
+    if topmost_only:
+        n_buried = _filter_topmost_faces(bm, ray_height=ray_height)
+        n_interior_removed += n_buried
 
     n_kept = len(bm.faces)
     bm.to_mesh(me)
@@ -567,7 +598,6 @@ class SILH_OT_create_plane(bpy.types.Operator):
 
         try:
             if s.mode == 'EXTRACT':
-                # Extraction directe des faces du dessus de la cible (fidélité max, zéro escalier)
                 obj, n_faces, n_interior = extract_top_surface(
                     target=s.target,
                     name=s.output_name,
@@ -575,10 +605,12 @@ class SILH_OT_create_plane(bpy.types.Operator):
                     use_modifiers=s.use_modifiers,
                     exterior_only=s.exterior_only,
                     escape_distance=s.escape_distance,
+                    topmost_only=s.topmost_only,
+                    ray_height=s.cast_height,
                 )
                 msg_extra = f"{n_faces} faces extraites"
-                if s.exterior_only:
-                    msg_extra += f", {n_interior} intérieures supprimées"
+                if s.exterior_only or s.topmost_only:
+                    msg_extra += f", {n_interior} enfouies supprimées"
             elif s.mode == 'MULTIDIR':
                 obj, n_v, n_f = build_multidir_silhouette(
                     target=s.target,
@@ -686,6 +718,11 @@ class SILH_settings(bpy.types.PropertyGroup):
         default=False,
         description="Supprime les faces enfouies (intérieures aux coquilles superposées) via ray-cast. Plus lent mais propre sur les meshes avec shells doublés.",
     )
+    topmost_only: BoolProperty(
+        name="Topmost seulement",
+        default=True,
+        description="Pour chaque face, ray-cast vertical depuis le haut. Garde uniquement les faces qui sont les premières touchées (= peau du dessus visible). Élimine TOUTES les couches enfouies.",
+    )
     escape_distance: FloatProperty(
         name="Distance test",
         default=0.005, min=0.0001, max=1.0, precision=4,
@@ -776,12 +813,14 @@ class SILH_PT_panel(bpy.types.Panel):
             box.label(text="Extraction directe")
             box.prop(s, "normal_z_threshold")
             box.prop(s, "use_modifiers")
+            box.prop(s, "topmost_only")
             box.prop(s, "exterior_only")
             sub = box.row()
             sub.enabled = s.exterior_only
             sub.prop(s, "escape_distance")
             box.label(text="Aucune approximation, fidélité parfaite", icon='CHECKMARK')
-            box.label(text="Topologie héritée de la source", icon='ERROR')
+            if s.topmost_only:
+                box.label(text="Topmost: élimine couches enfouies", icon='CHECKMARK')
         elif s.mode == 'MULTIDIR':
             box = layout.box()
             box.label(text="Cible & Limites")
