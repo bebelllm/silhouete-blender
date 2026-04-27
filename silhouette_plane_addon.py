@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -108,17 +108,21 @@ def _laplacian_smooth_boundary(plane_bm, iterations=3, factor=0.5):
             v.co.y = y
 
 
-def extract_top_surface(target, name, normal_z_threshold=-0.5):
+def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=True):
     """Extrait directement les faces de target dont la normale.z > seuil.
-    Approche : duplique la mesh, puis supprime les faces non voulues (10x plus rapide
-    qu'un copy-by-face avec dédup de verts)."""
-    # Clone le mesh
-    me = target.data.copy()
+    Si use_modifiers=True, utilise le mesh ÉVALUÉ (avec modificateurs appliqués)."""
+    # Récupère le mesh à utiliser
+    if use_modifiers:
+        deps = bpy.context.evaluated_depsgraph_get()
+        ev = target.evaluated_get(deps)
+        me = bpy.data.meshes.new_from_object(ev, depsgraph=deps)
+    else:
+        me = target.data.copy()
+
     if name in bpy.data.objects:
         bpy.data.objects.remove(bpy.data.objects[name], do_unlink=True)
     obj = bpy.data.objects.new(name, me)
     bpy.context.collection.objects.link(obj)
-    obj.matrix_world = target.matrix_world.copy()
 
     # bmesh : supprime les faces non voulues + verts orphelins
     bm = bmesh.new()
@@ -330,6 +334,7 @@ class SILH_OT_create_plane(bpy.types.Operator):
                     target=s.target,
                     name=s.output_name,
                     normal_z_threshold=s.normal_z_threshold,
+                    use_modifiers=s.use_modifiers,
                 )
                 msg_extra = f"{n_faces} faces extraites"
             else:
@@ -398,6 +403,11 @@ class SILH_settings(bpy.types.PropertyGroup):
         name="Seuil normal Z",
         default=-0.5, min=-1.0, max=1.0,
         description="Garde les faces dont la normale.z > seuil. -0.5 = tops + flancs (recommandé). 0.1 = tops seulement (sans flancs). -0.99 = tout sauf le dessous strict.",
+    )
+    use_modifiers: BoolProperty(
+        name="Avec modificateurs",
+        default=True,
+        description="Utilise le mesh évalué (avec modificateurs appliqués) plutôt que le mesh source brut. Important si la cible a Solidify, Subsurf, BASIFY, etc.",
     )
     target: PointerProperty(
         name="Cible",
@@ -483,6 +493,7 @@ class SILH_PT_panel(bpy.types.Panel):
             box = layout.box()
             box.label(text="Extraction directe")
             box.prop(s, "normal_z_threshold")
+            box.prop(s, "use_modifiers")
             box.label(text="Aucune approximation, fidélité parfaite", icon='CHECKMARK')
             box.label(text="Topologie héritée de la source", icon='ERROR')
         else:
