@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -178,6 +178,167 @@ def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=Tru
     obj.matrix_world = mathutils.Matrix.Identity(4)
 
     return obj, n_kept, n_interior_removed
+
+
+def _raycast_grid(bvh, axis, direction_sign, plane_origin, u_min, u_max, v_min, v_max, res_u, res_v, max_dist):
+    """Génère une grille perpendiculaire à `axis` ('X','Y','Z') et ray-caste dans le sens direction_sign.
+    Retourne un bmesh contenant uniquement les verts/faces qui ont hit la cible.
+    `axis` = direction du rayon, `plane_origin` = position du plan sur cet axe.
+    `u_min..v_max` = bornes 2D dans les axes perpendiculaires."""
+    bm = bmesh.new()
+    grid = []
+    direction = Vector((0, 0, 0))
+    if axis == 'X':
+        direction.x = direction_sign
+        u_axis_idx, v_axis_idx, fixed_idx = 1, 2, 0  # u=Y, v=Z
+    elif axis == 'Y':
+        direction.y = direction_sign
+        u_axis_idx, v_axis_idx, fixed_idx = 0, 2, 1  # u=X, v=Z
+    else:  # Z
+        direction.z = direction_sign
+        u_axis_idx, v_axis_idx, fixed_idx = 0, 1, 2  # u=X, v=Y
+
+    for j in range(res_v):
+        row = []
+        v = v_min + (v_max - v_min) * j / (res_v - 1)
+        for i in range(res_u):
+            u = u_min + (u_max - u_min) * i / (res_u - 1)
+            co = [0.0, 0.0, 0.0]
+            co[u_axis_idx] = u
+            co[v_axis_idx] = v
+            co[fixed_idx] = plane_origin
+            row.append(bm.verts.new(co))
+        grid.append(row)
+    bm.verts.ensure_lookup_table()
+    for j in range(res_v - 1):
+        for i in range(res_u - 1):
+            bm.faces.new([grid[j][i], grid[j][i+1], grid[j+1][i+1], grid[j+1][i]])
+
+    # Ray-cast chaque vert
+    for v in bm.verts:
+        loc, n, idx, dist = bvh.ray_cast(v.co, direction, max_dist)
+        if loc is not None:
+            v.co = loc.copy()
+
+    # Supprimer les faces dont aucun vert n'a hit (verts qui sont restés sur le plan d'origine)
+    bm.faces.ensure_lookup_table()
+    to_remove = [f for f in bm.faces if all(abs(vv.co[fixed_idx] - plane_origin) < 0.0001 for vv in f.verts)]
+    bmesh.ops.delete(bm, geom=to_remove, context='FACES')
+    loose = [vv for vv in bm.verts if not vv.link_faces]
+    if loose:
+        bmesh.ops.delete(bm, geom=loose, context='VERTS')
+
+    return bm
+
+
+def build_multidir_silhouette(target, bounds_obj, res_top, res_side, max_dist, name,
+                               cast_top=True, cast_bottom=False,
+                               cast_xneg=True, cast_xpos=True,
+                               cast_yneg=True, cast_ypos=True,
+                               use_modifiers=True, merge_threshold=0.001):
+    """Lance plusieurs ray-casts (top + 4 côtés + bottom optionnel) et combine les hits dans un seul mesh.
+    Couvre les flancs verticaux que la simple grille du dessus ne capture pas."""
+    # Mesh évalué
+    if use_modifiers:
+        deps = bpy.context.evaluated_depsgraph_get()
+        ev = target.evaluated_get(deps)
+        src_me = bpy.data.meshes.new_from_object(ev, depsgraph=deps)
+    else:
+        src_me = target.data.copy()
+
+    # BVH en world coords
+    bm_t = bmesh.new()
+    bm_t.from_mesh(src_me)
+    bm_t.transform(target.matrix_world)
+    bvh = BVHTree.FromBMesh(bm_t)
+
+    # Bbox world (depuis bounds_obj ou bbox cible)
+    src = bounds_obj if bounds_obj is not None else target
+    corners = [src.matrix_world @ Vector(c) for c in src.bound_box]
+    if src is target and bounds_obj is None:
+        # bbox réelle de la mesh évaluée
+        if bm_t.verts:
+            xs = [v.co.x for v in bm_t.verts]
+            ys = [v.co.y for v in bm_t.verts]
+            zs = [v.co.z for v in bm_t.verts]
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
+            zmin, zmax = min(zs), max(zs)
+        else:
+            xmin = xmax = ymin = ymax = zmin = zmax = 0
+    else:
+        xs = [c.x for c in corners]; ys = [c.y for c in corners]; zs = [c.z for c in corners]
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        zmin, zmax = min(zs), max(zs)
+    bm_t.free()
+
+    # Petite marge pour les origines de plans
+    margin = max((xmax-xmin), (ymax-ymin), (zmax-zmin)) * 0.1 + 0.01
+
+    bm_final = bmesh.new()
+
+    def merge_bm(src_bm):
+        # Ajouter les verts/faces de src_bm dans bm_final
+        vmap = {}
+        for v in src_bm.verts:
+            vmap[v] = bm_final.verts.new(v.co.copy())
+        for f in src_bm.faces:
+            try:
+                bm_final.faces.new([vmap[v] for v in f.verts])
+            except ValueError:
+                pass
+        src_bm.free()
+
+    # TOP : plan à Z=zmax+margin, rayons vers le bas
+    if cast_top:
+        b = _raycast_grid(bvh, 'Z', -1, zmax + margin,
+                          xmin, xmax, ymin, ymax, res_top, res_top * (ymax-ymin) // (xmax-xmin) if (xmax > xmin) else res_top,
+                          max_dist)
+        merge_bm(b)
+
+    # BOTTOM
+    if cast_bottom:
+        b = _raycast_grid(bvh, 'Z', 1, zmin - margin,
+                          xmin, xmax, ymin, ymax, res_top, res_top * (ymax-ymin) // (xmax-xmin) if (xmax > xmin) else res_top,
+                          max_dist)
+        merge_bm(b)
+
+    # SIDES : plans verticaux
+    side_res_v = res_side  # vertical resolution = side height
+    if cast_xneg:
+        b = _raycast_grid(bvh, 'X', 1, xmin - margin,
+                          ymin, ymax, zmin, zmax, res_side, side_res_v, max_dist)
+        merge_bm(b)
+    if cast_xpos:
+        b = _raycast_grid(bvh, 'X', -1, xmax + margin,
+                          ymin, ymax, zmin, zmax, res_side, side_res_v, max_dist)
+        merge_bm(b)
+    if cast_yneg:
+        b = _raycast_grid(bvh, 'Y', 1, ymin - margin,
+                          xmin, xmax, zmin, zmax, res_side, side_res_v, max_dist)
+        merge_bm(b)
+    if cast_ypos:
+        b = _raycast_grid(bvh, 'Y', -1, ymax + margin,
+                          xmin, xmax, zmin, zmax, res_side, side_res_v, max_dist)
+        merge_bm(b)
+
+    # Souder les doublons à la jonction des 5/6 plans
+    bmesh.ops.remove_doubles(bm_final, verts=list(bm_final.verts), dist=merge_threshold)
+
+    # Output object
+    if name in bpy.data.objects:
+        bpy.data.objects.remove(bpy.data.objects[name], do_unlink=True)
+    me = bpy.data.meshes.new(name + "_mesh")
+    bm_final.to_mesh(me)
+    n_verts = len(bm_final.verts); n_faces = len(bm_final.faces)
+    bm_final.free()
+    bpy.data.meshes.remove(src_me)
+
+    obj = bpy.data.objects.new(name, me)
+    bpy.context.collection.objects.link(obj)
+
+    return obj, n_verts, n_faces
 
 
 def build_silhouette_plane(target, bounds_obj, res_x, res_y, cast_height, cast_distance, name,
@@ -374,6 +535,21 @@ class SILH_OT_create_plane(bpy.types.Operator):
                 msg_extra = f"{n_faces} faces extraites"
                 if s.exterior_only:
                     msg_extra += f", {n_interior} intérieures supprimées"
+            elif s.mode == 'MULTIDIR':
+                obj, n_v, n_f = build_multidir_silhouette(
+                    target=s.target,
+                    bounds_obj=s.bounds_object,
+                    res_top=s.res_x,
+                    res_side=s.res_side,
+                    max_dist=s.cast_distance,
+                    name=s.output_name,
+                    cast_top=s.cast_top, cast_bottom=s.cast_bottom,
+                    cast_xneg=s.cast_xneg, cast_xpos=s.cast_xpos,
+                    cast_yneg=s.cast_yneg, cast_ypos=s.cast_ypos,
+                    use_modifiers=s.use_modifiers,
+                    merge_threshold=s.merge_threshold,
+                )
+                msg_extra = f"{n_v}v {n_f}f multi-dir"
             else:
                 # Mode RAYCAST : grille + ray-cast
                 obj, hits, border_snapped = build_silhouette_plane(
@@ -430,11 +606,27 @@ class SILH_settings(bpy.types.PropertyGroup):
     mode: EnumProperty(
         name="Mode",
         items=[
-            ('RAYCAST', "Ray-cast grille", "Grille subdivisée + ray-cast (résolution réglable, peut générer un escalier sur les bords)"),
-            ('EXTRACT', "Extraire surface source", "Copie directe des faces du dessus de la cible (fidélité parfaite, pas d'escalier, mais hérite de la topologie source)"),
+            ('RAYCAST', "Ray-cast top", "Grille du haut + ray-cast vertical (top seulement)"),
+            ('MULTIDIR', "Ray-cast multi-direction", "Ray-cast depuis le haut + 4 côtés (top + flancs, capture la peau extérieure complète)"),
+            ('EXTRACT', "Extraire surface source", "Copie directe des faces de la cible (fidélité parfaite, hérite topologie source, peut garder des faces enfouies)"),
         ],
         default='RAYCAST',
         description="Méthode de génération du plan",
+    )
+    res_side: IntProperty(
+        name="Résolution flancs", default=400, min=10, max=4000,
+        description="Résolution des grilles latérales (multi-direction)",
+    )
+    cast_top: BoolProperty(name="Top", default=True, description="Ray-cast depuis le haut")
+    cast_bottom: BoolProperty(name="Bottom", default=False, description="Ray-cast depuis le bas")
+    cast_xneg: BoolProperty(name="-X", default=True, description="Ray-cast depuis -X")
+    cast_xpos: BoolProperty(name="+X", default=True, description="Ray-cast depuis +X")
+    cast_yneg: BoolProperty(name="-Y", default=True, description="Ray-cast depuis -Y")
+    cast_ypos: BoolProperty(name="+Y", default=True, description="Ray-cast depuis +Y")
+    merge_threshold: FloatProperty(
+        name="Seuil fusion jonctions",
+        default=0.001, min=0.00001, max=0.1, precision=5,
+        description="Distance pour souder les verts aux jonctions entre les grilles top/côtés",
     )
     normal_z_threshold: FloatProperty(
         name="Seuil normal Z",
@@ -547,6 +739,28 @@ class SILH_PT_panel(bpy.types.Panel):
             sub.prop(s, "escape_distance")
             box.label(text="Aucune approximation, fidélité parfaite", icon='CHECKMARK')
             box.label(text="Topologie héritée de la source", icon='ERROR')
+        elif s.mode == 'MULTIDIR':
+            box = layout.box()
+            box.label(text="Cible & Limites")
+            box.prop(s, "bounds_object", text="Limites XY")
+
+            box = layout.box()
+            box.label(text="Résolution")
+            box.prop(s, "res_x", text="Top (haut/bas)")
+            box.prop(s, "res_side")
+
+            box = layout.box()
+            box.label(text="Directions ray-cast")
+            row = box.row(align=True); row.prop(s, "cast_top"); row.prop(s, "cast_bottom")
+            row = box.row(align=True); row.prop(s, "cast_xneg"); row.prop(s, "cast_xpos")
+            row = box.row(align=True); row.prop(s, "cast_yneg"); row.prop(s, "cast_ypos")
+
+            box = layout.box()
+            box.prop(s, "use_modifiers")
+            box.prop(s, "cast_distance")
+            box.prop(s, "merge_threshold")
+            box.label(text="Capture peau extérieure (top + flancs)", icon='CHECKMARK')
+            box.label(text="Pas de surfaces enfouies", icon='CHECKMARK')
         else:
             box = layout.box()
             box.label(text="Cible")
