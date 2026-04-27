@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 9, 0),
+    "version": (1, 9, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -253,7 +253,6 @@ def bake_clean_remesh(target, name, voxel_size=0.005, merge_threshold=0.0001,
         for item in basify_ng.interface.items_tree:
             if hasattr(item, 'in_out') and item.in_out == 'INPUT':
                 if item.name == 'FOUNDATION_THICKNESS':
-                    target[item.identifier] if False else None  # noop
                     m_temp[item.identifier] = basify_thickness
                 elif item.name == 'INCLUDE_BOTTOM':
                     m_temp[item.identifier] = True
@@ -878,8 +877,8 @@ class SILH_settings(bpy.types.PropertyGroup):
     )
     do_voxel_remesh: BoolProperty(
         name="Voxel Remesh final",
-        default=True,
-        description="Applique un voxel remesh à la fin pour produire un shell manifold propre.",
+        default=False,
+        description="Applique un voxel remesh à la fin (CHANGE LA TOPOLOGIE). Décoché = résultat identique à produit_baked_clean (juste BASIFY+merge+interior).",
     )
     remesh_fix_poles: BoolProperty(
         name="Fix Poles", default=True,
