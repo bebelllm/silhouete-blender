@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 5, 0),
+    "version": (1, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -293,14 +293,14 @@ def build_multidir_silhouette(target, bounds_obj, res_top, res_side, max_dist, n
     # TOP : plan à Z=zmax+margin, rayons vers le bas
     if cast_top:
         b = _raycast_grid(bvh, 'Z', -1, zmax + margin,
-                          xmin, xmax, ymin, ymax, res_top, res_top * (ymax-ymin) // (xmax-xmin) if (xmax > xmin) else res_top,
+                          xmin, xmax, ymin, ymax, res_top, int(res_top * (ymax-ymin) / (xmax-xmin)) if (xmax > xmin) else res_top,
                           max_dist)
         merge_bm(b)
 
     # BOTTOM
     if cast_bottom:
         b = _raycast_grid(bvh, 'Z', 1, zmin - margin,
-                          xmin, xmax, ymin, ymax, res_top, res_top * (ymax-ymin) // (xmax-xmin) if (xmax > xmin) else res_top,
+                          xmin, xmax, ymin, ymax, res_top, int(res_top * (ymax-ymin) / (xmax-xmin)) if (xmax > xmin) else res_top,
                           max_dist)
         merge_bm(b)
 
@@ -411,6 +411,50 @@ def build_silhouette_plane(target, bounds_obj, res_x, res_y, cast_height, cast_d
     bpy.context.collection.objects.link(obj)
 
     return obj, snapped, border_snapped
+
+
+def add_sides_bmesh(obj, floor_z=0.0):
+    """Ferme le mesh en pur bmesh : extrude boundary edges vers floor_z + remplit le fond.
+    Beaucoup plus rapide que la version GeoNodes (pas de Mesh→Curve+Fill Curve)."""
+    me = obj.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.faces.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+
+    # 1. Boundary edges (face_count == 1)
+    boundary_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+    if not boundary_edges:
+        bm.free()
+        return 0
+
+    # 2. Extrude ces edges. Le résultat duplique les verts ; on déplace les nouveaux à floor_z
+    ret = bmesh.ops.extrude_edge_only(bm, edges=boundary_edges)
+    new_verts = [g for g in ret['geom'] if isinstance(g, bmesh.types.BMVert)]
+    for v in new_verts:
+        v.co.z = floor_z
+
+    # 3. Récup edges au floor_z toujours boundary → fill
+    bm.edges.ensure_lookup_table()
+    floor_edges = [e for e in bm.edges
+                   if abs(e.verts[0].co.z - floor_z) < 0.0001
+                   and abs(e.verts[1].co.z - floor_z) < 0.0001
+                   and len(e.link_faces) == 1]
+
+    n_filled = 0
+    if floor_edges:
+        try:
+            res = bmesh.ops.triangle_fill(bm, edges=floor_edges, use_beauty=True,
+                                           normal=Vector((0, 0, -1)))
+            n_filled = sum(1 for g in res.get('geom', []) if isinstance(g, bmesh.types.BMFace))
+        except Exception:
+            pass
+
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(me)
+    bm.free()
+    return n_filled
 
 
 def add_sides_geonodes(obj, floor_z=0.0):
@@ -573,17 +617,16 @@ class SILH_OT_create_plane(bpy.types.Operator):
             return {'CANCELLED'}
 
         if s.add_sides:
-            # En mode EXTRACT, le mesh peut être très lourd (1M+ faces) et le GeoNodes
-            # Mesh→Curve+Fill plante. Si > 300k faces, on prévient et on skip.
-            if s.mode == 'EXTRACT' and len(obj.data.polygons) > 300_000:
-                self.report({'WARNING'},
-                    f"Mesh trop dense ({len(obj.data.polygons)}f) — flancs+fond skipés "
-                    f"(risque crash). Décime d'abord puis ferme manuellement.")
-            else:
-                try:
+            try:
+                if s.mode == 'EXTRACT':
+                    # bmesh direct (rapide, gère les meshes 1M+ faces sans crash)
+                    n_filled = add_sides_bmesh(obj, floor_z=s.floor_z)
+                    msg_extra += f", fond fermé ({n_filled} faces)"
+                else:
+                    # GeoNodes non-destructif (modificateur ajustable)
                     add_sides_geonodes(obj, floor_z=s.floor_z)
-                except Exception as e:
-                    self.report({'WARNING'}, f"Plan généré mais sides échoué: {e}")
+            except Exception as e:
+                self.report({'WARNING'}, f"Plan généré mais sides échoué: {e}")
 
         for o in bpy.context.selected_objects:
             o.select_set(False)
