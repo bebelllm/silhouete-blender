@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 8, 1),
+    "version": (1, 9, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -230,19 +230,44 @@ def _filter_exterior_faces_by_raycast(bm, escape_distance=100.0):
     return len(interior)
 
 
-def bake_clean_remesh(target, name, voxel_size=0.003, merge_threshold=0.0001,
+def bake_clean_remesh(target, name, voxel_size=0.005, merge_threshold=0.0001,
                        fix_poles=True, preserve_volume=True,
-                       smooth_shading=False, close_bottom=True, floor_z=0.0):
-    """Pipeline 'mesh propre fermé' :
-    1. Duplique le target avec modificateurs appliqués (mesh évalué)
-    2. Merge by Distance pour éliminer les doublons exacts
-    3. (optionnel) Ferme le fond : extrude boundaries vers floor_z + triangle_fill
-    4. Voxel Remesh → shell extérieur manifold sans intérieur
-    Le close_bottom est essentiel si le mesh source a le dessous ouvert,
-    sinon le voxel remesh reproduit le shell ouvert."""
-    deps = bpy.context.evaluated_depsgraph_get()
-    ev = target.evaluated_get(deps)
-    me = bpy.data.meshes.new_from_object(ev, depsgraph=deps)
+                       smooth_shading=False,
+                       auto_add_basify=True, basify_thickness=0.005,
+                       do_select_interior=True, do_voxel_remesh=True):
+    """Reproduit le pipeline manuel qui a donné produit_baked_clean :
+    1. (optionnel) Ajoute BASIFY_MOD_MAKE_MANIFOLD si présent dans .blend et pas déjà sur target
+    2. Duplique avec modificateurs appliqués (mesh évalué)
+    3. Edit mode → Select All → Merge by Distance
+    4. Edit mode → Select Interior Faces → Delete
+    5. (optionnel) Voxel Remesh"""
+
+    # 1. Ajout BASIFY_MOD_MAKE_MANIFOLD temporaire si demandé et dispo
+    temp_mod_added = False
+    basify_ng = bpy.data.node_groups.get("BASIFY_MOD_MAKE_MANIFOLD_v2")
+    has_basify = any(m.type == 'NODES' and m.node_group and m.node_group.name == "BASIFY_MOD_MAKE_MANIFOLD_v2"
+                     for m in target.modifiers)
+    if auto_add_basify and basify_ng is not None and not has_basify:
+        m_temp = target.modifiers.new(name="_TEMP_BasifyManifold", type='NODES')
+        m_temp.node_group = basify_ng
+        for item in basify_ng.interface.items_tree:
+            if hasattr(item, 'in_out') and item.in_out == 'INPUT':
+                if item.name == 'FOUNDATION_THICKNESS':
+                    target[item.identifier] if False else None  # noop
+                    m_temp[item.identifier] = basify_thickness
+                elif item.name == 'INCLUDE_BOTTOM':
+                    m_temp[item.identifier] = True
+        temp_mod_added = True
+
+    try:
+        # 2. Dup avec modificateurs appliqués
+        deps = bpy.context.evaluated_depsgraph_get()
+        ev = target.evaluated_get(deps)
+        me = bpy.data.meshes.new_from_object(ev, depsgraph=deps)
+    finally:
+        # Retirer le modif temporaire de la cible originale
+        if temp_mod_added:
+            target.modifiers.remove(target.modifiers["_TEMP_BasifyManifold"])
 
     if name in bpy.data.objects:
         bpy.data.objects.remove(bpy.data.objects[name], do_unlink=True)
@@ -254,30 +279,39 @@ def bake_clean_remesh(target, name, voxel_size=0.003, merge_threshold=0.0001,
     for o in bpy.context.selected_objects: o.select_set(False)
     obj.select_set(True)
 
-    # Merge by Distance
+    n_initial = len(obj.data.vertices)
+
+    # 3. Merge by Distance
     bpy.ops.object.mode_set(mode='EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.mesh.remove_doubles(threshold=merge_threshold)
     bpy.ops.object.mode_set(mode='OBJECT')
-
     n_after_merge = len(obj.data.vertices)
 
-    # Fermer le fond AVANT remesh (sinon remesh garde l'ouverture)
-    n_filled = 0
-    if close_bottom:
-        n_filled = add_sides_bmesh(obj, floor_z=floor_z)
+    # 4. Select Interior Faces → Delete
+    n_interior = 0
+    if do_select_interior:
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='DESELECT')
+        bpy.ops.mesh.select_mode(type='FACE')
+        bpy.ops.mesh.select_interior_faces()
+        n_interior = sum(1 for f in obj.data.polygons if f.select)
+        if n_interior > 0:
+            bpy.ops.mesh.delete(type='FACE')
+        bpy.ops.object.mode_set(mode='OBJECT')
 
-    # Voxel Remesh
-    obj.data.remesh_voxel_size = voxel_size
-    obj.data.use_remesh_fix_poles = fix_poles
-    obj.data.use_remesh_preserve_volume = preserve_volume
-    bpy.ops.object.voxel_remesh()
+    # 5. Voxel Remesh (optionnel)
+    if do_voxel_remesh:
+        obj.data.remesh_voxel_size = voxel_size
+        obj.data.use_remesh_fix_poles = fix_poles
+        obj.data.use_remesh_preserve_volume = preserve_volume
+        bpy.ops.object.voxel_remesh()
 
     if smooth_shading:
         for f in obj.data.polygons:
             f.use_smooth = True
 
-    return obj, n_after_merge, n_filled
+    return obj, n_initial, n_after_merge, n_interior
 
 
 def extract_top_surface(target, name, normal_z_threshold=-0.5, use_modifiers=True,
@@ -731,7 +765,7 @@ class SILH_OT_create_plane(bpy.types.Operator):
                 if s.exterior_only or s.topmost_only:
                     msg_extra += f", {n_interior} enfouies supprimées"
             elif s.mode == 'BAKE_REMESH':
-                obj, n_merged, n_filled = bake_clean_remesh(
+                obj, n_init, n_merged, n_int = bake_clean_remesh(
                     target=s.target,
                     name=s.output_name,
                     voxel_size=s.voxel_size,
@@ -739,10 +773,12 @@ class SILH_OT_create_plane(bpy.types.Operator):
                     fix_poles=s.remesh_fix_poles,
                     preserve_volume=s.remesh_preserve_volume,
                     smooth_shading=s.smooth_shading,
-                    close_bottom=s.bake_close_bottom,
-                    floor_z=s.floor_z,
+                    auto_add_basify=s.auto_add_basify,
+                    basify_thickness=s.basify_thickness,
+                    do_select_interior=s.do_select_interior,
+                    do_voxel_remesh=s.do_voxel_remesh,
                 )
-                msg_extra = f"merge → {n_merged}v, fond fermé ({n_filled}f), remesh → {len(obj.data.vertices)}v {len(obj.data.polygons)}f"
+                msg_extra = f"start {n_init}v → merge {n_merged}v → interior -{n_int}f → final {len(obj.data.vertices)}v {len(obj.data.polygons)}f"
             elif s.mode == 'MULTIDIR':
                 obj, n_v, n_f = build_multidir_silhouette(
                     target=s.target,
@@ -825,10 +861,25 @@ class SILH_settings(bpy.types.PropertyGroup):
         name="Voxel size", default=0.005, min=0.001, max=1.0, precision=4,
         description="Taille du voxel pour le remesh. Plus petit = plus précis mais plus lourd. 0.005 = 5mm (sûr). <0.003 risque de freezer Blender sur grands meshes (3m×1.5m).",
     )
-    bake_close_bottom: BoolProperty(
-        name="Fermer le fond avant remesh",
+    auto_add_basify: BoolProperty(
+        name="Ajouter BASIFY MAKE MANIFOLD si dispo",
         default=True,
-        description="Extrude les boundaries vers Floor Z et triangule, AVANT le voxel remesh. Indispensable si le mesh source a le dessous ouvert (sinon le remesh reproduit l'ouverture).",
+        description="Si le node group BASIFY_MOD_MAKE_MANIFOLD_v2 est dans le .blend et n'est pas déjà sur la cible, l'ajoute temporairement avant l'application des modifs (= ferme le mesh comme produit.001).",
+    )
+    basify_thickness: FloatProperty(
+        name="Épaisseur fondation BASIFY",
+        default=0.005, min=0.0001, max=0.1, precision=4,
+        description="FOUNDATION_THICKNESS pour le BASIFY MAKE MANIFOLD ajouté automatiquement",
+    )
+    do_select_interior: BoolProperty(
+        name="Select Interior Faces + Delete",
+        default=True,
+        description="Étape 'select_interior_faces' Blender natif après merge — supprime les faces internes détectables.",
+    )
+    do_voxel_remesh: BoolProperty(
+        name="Voxel Remesh final",
+        default=True,
+        description="Applique un voxel remesh à la fin pour produire un shell manifold propre.",
     )
     remesh_fix_poles: BoolProperty(
         name="Fix Poles", default=True,
@@ -964,17 +1015,24 @@ class SILH_PT_panel(bpy.types.Panel):
 
         if s.mode == 'BAKE_REMESH':
             box = layout.box()
-            box.label(text="Bake & Voxel Remesh")
-            box.prop(s, "voxel_size")
+            box.label(text="Pipeline BASIFY → merge → interior → remesh")
+
+            box.prop(s, "auto_add_basify")
+            sub = box.row(); sub.enabled = s.auto_add_basify
+            sub.prop(s, "basify_thickness")
+
             box.prop(s, "merge_threshold")
-            box.prop(s, "bake_close_bottom")
-            sub = box.row(); sub.enabled = s.bake_close_bottom
-            sub.prop(s, "floor_z")
-            box.prop(s, "remesh_fix_poles")
-            box.prop(s, "remesh_preserve_volume")
+            box.prop(s, "do_select_interior")
+
+            box.prop(s, "do_voxel_remesh")
+            sub = box.column(); sub.enabled = s.do_voxel_remesh
+            sub.prop(s, "voxel_size")
+            sub.prop(s, "remesh_fix_poles")
+            sub.prop(s, "remesh_preserve_volume")
+
             box.prop(s, "smooth_shading")
-            box.label(text="Shell extérieur manifold garanti", icon='CHECKMARK')
-            box.label(text="Voxel <0.002 risque crash sur gros mesh", icon='ERROR')
+            box.label(text="Reproduit le pipeline manuel produit.001 → produit_baked_clean", icon='CHECKMARK')
+            box.label(text="Voxel <0.003 risque crash sur gros mesh", icon='ERROR')
         elif s.mode == 'EXTRACT':
             box = layout.box()
             box.label(text="Extraction directe")
