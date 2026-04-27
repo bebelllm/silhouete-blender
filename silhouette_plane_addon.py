@@ -115,6 +115,7 @@ def extract_top_surface(target, name, normal_z_threshold=0.1):
     bm_src = bmesh.new()
     bm_src.from_mesh(target.data)
     bm_src.transform(target.matrix_world)
+    bm_src.normal_update()  # recompute normals after transform (sinon faux pour objets rotated)
     bm_src.faces.ensure_lookup_table()
 
     keep_faces = [f for f in bm_src.faces if f.normal.z > normal_z_threshold]
@@ -391,8 +392,8 @@ class SILH_settings(bpy.types.PropertyGroup):
     )
     normal_z_threshold: FloatProperty(
         name="Seuil normal Z",
-        default=0.1, min=-1.0, max=1.0,
-        description="Garde les faces dont la normale Z dépasse ce seuil (0 = horizontal, 1 = vertical strict). 0.1 capture toutes les faces plutôt vers le haut.",
+        default=-0.5, min=-1.0, max=1.0,
+        description="Garde les faces dont la normale.z > seuil. -0.5 = tops + flancs (recommandé). 0.1 = tops seulement (sans flancs). -0.99 = tout sauf le dessous strict.",
     )
     target: PointerProperty(
         name="Cible",
