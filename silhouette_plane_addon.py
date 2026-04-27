@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 11, 1),
+    "version": (1, 11, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -670,6 +670,9 @@ def get_or_create_remove_interior_nodegroup():
         return bpy.data.node_groups[name]
 
     ng = bpy.data.node_groups.new(name, "GeometryNodeTree")
+    # Marquer comme modificateur pour qu'il apparaisse dans le dropdown GN modifier
+    if hasattr(ng, 'is_modifier'):
+        ng.is_modifier = True
     ng.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
     ng.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
     ng.interface.new_socket(name="Ray Distance", in_out='INPUT', socket_type='NodeSocketFloat')
