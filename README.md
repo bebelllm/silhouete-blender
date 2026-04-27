@@ -14,12 +14,23 @@ Idéal pour :
 3. Cocher **Plan Silhouette** dans la liste
 4. Sidebar 3D View (`N`) > onglet **Silhouette**
 
+## Modes
+
+L'addon propose **deux modes** :
+
+### Ray-cast grille (défaut)
+Génère une grille subdivisée et ray-caste chaque vert vers la cible. Donne une **topologie quad propre et régulière**, résolution réglable. Peut produire un effet escalier sur les bords (mitigé par les options de lissage).
+
+### Extraire surface source
+Copie directement les faces du dessus de la cible (celles dont la normale pointe vers le haut). **Fidélité parfaite, aucun escalier**, mais hérite de la topologie de la source (peut être très dense, parfois sale).
+
 ## Utilisation
 
-1. Définir la **Cible** (mesh dont on veut copier la surface)
-2. Optionnel : **Limites XY** (objet définissant l'emprise du plan, défaut = bbox cible)
-3. Régler la **Résolution** de la grille (1600 × 800 par défaut)
-4. Cliquer **Créer Plan Silhouette**
+1. Choisir le **mode** (Ray-cast ou Extraire)
+2. Définir la **Cible** (mesh source)
+3. Mode Ray-cast : régler **Résolution** et options de lissage
+4. Mode Extraire : régler **Seuil normal Z** (0.1 par défaut capture toutes les faces "plutôt vers le haut")
+5. Cliquer **Créer Plan Silhouette**
 
 ## Réglages
 

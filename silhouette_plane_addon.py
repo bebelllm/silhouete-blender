@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plan Silhouette",
     "author": "Mika",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Silhouette",
     "description": "Crée un plan dont chaque vert est snappé sur la surface d'un objet cible (silhouette + relief Z) via ray-cast. Pratique pour extraire un bas-relief ou une heightmap topologique.",
@@ -106,6 +106,43 @@ def _laplacian_smooth_boundary(plane_bm, iterations=3, factor=0.5):
         for v, (x, y) in new_pos.items():
             v.co.x = x
             v.co.y = y
+
+
+def extract_top_surface(target, name, normal_z_threshold=0.1):
+    """Extrait directement les faces de target dont la normale pointe vers le haut.
+    Aucune grille, aucun ray-cast → fidélité parfaite, pas d'effet escalier.
+    Le résultat utilise la topologie de la source."""
+    bm_src = bmesh.new()
+    bm_src.from_mesh(target.data)
+    bm_src.transform(target.matrix_world)
+    bm_src.faces.ensure_lookup_table()
+
+    keep_faces = [f for f in bm_src.faces if f.normal.z > normal_z_threshold]
+
+    bm_out = bmesh.new()
+    vert_map = {}
+    for f in keep_faces:
+        new_verts = []
+        for v in f.verts:
+            if v not in vert_map:
+                vert_map[v] = bm_out.verts.new(v.co.copy())
+            new_verts.append(vert_map[v])
+        try:
+            bm_out.faces.new(new_verts)
+        except ValueError:
+            pass
+    bm_src.free()
+    bm_out.normal_update()
+
+    if name in bpy.data.objects:
+        bpy.data.objects.remove(bpy.data.objects[name], do_unlink=True)
+    me = bpy.data.meshes.new(name + "_mesh")
+    bm_out.to_mesh(me)
+    bm_out.free()
+    obj = bpy.data.objects.new(name, me)
+    bpy.context.collection.objects.link(obj)
+
+    return obj, len(keep_faces)
 
 
 def build_silhouette_plane(target, bounds_obj, res_x, res_y, cast_height, cast_distance, name,
@@ -288,22 +325,33 @@ class SILH_OT_create_plane(bpy.types.Operator):
             self.report({'ERROR'}, "La cible doit être un mesh")
             return {'CANCELLED'}
 
-        bounds = s.bounds_object  # peut être None → on utilisera bbox de la cible
-
         try:
-            obj, hits, border_snapped = build_silhouette_plane(
-                target=s.target,
-                bounds_obj=bounds,
-                res_x=s.res_x,
-                res_y=s.res_y,
-                cast_height=s.cast_height,
-                cast_distance=s.cast_distance,
-                name=s.output_name,
-                smooth_borders=s.smooth_borders,
-                smooth_max_dist=s.smooth_max_dist,
-                laplacian_iters=s.laplacian_iters,
-                laplacian_factor=s.laplacian_factor,
-            )
+            if s.mode == 'EXTRACT':
+                # Extraction directe des faces du dessus de la cible (fidélité max, zéro escalier)
+                obj, n_faces = extract_top_surface(
+                    target=s.target,
+                    name=s.output_name,
+                    normal_z_threshold=s.normal_z_threshold,
+                )
+                msg_extra = f"{n_faces} faces extraites"
+            else:
+                # Mode RAYCAST : grille + ray-cast
+                obj, hits, border_snapped = build_silhouette_plane(
+                    target=s.target,
+                    bounds_obj=s.bounds_object,
+                    res_x=s.res_x,
+                    res_y=s.res_y,
+                    cast_height=s.cast_height,
+                    cast_distance=s.cast_distance,
+                    name=s.output_name,
+                    smooth_borders=s.smooth_borders,
+                    smooth_max_dist=s.smooth_max_dist,
+                    laplacian_iters=s.laplacian_iters,
+                    laplacian_factor=s.laplacian_factor,
+                )
+                msg_extra = f"{hits} hits"
+                if s.smooth_borders:
+                    msg_extra += f", {border_snapped} bordures snappées"
         except Exception as e:
             self.report({'ERROR'}, f"Erreur génération: {e}")
             return {'CANCELLED'}
@@ -314,17 +362,12 @@ class SILH_OT_create_plane(bpy.types.Operator):
             except Exception as e:
                 self.report({'WARNING'}, f"Plan généré mais sides échoué: {e}")
 
-        # Sélection finale
         for o in bpy.context.selected_objects:
             o.select_set(False)
         obj.select_set(True)
         context.view_layer.objects.active = obj
 
-        msg = f"{obj.name}: {len(obj.data.vertices)}v {len(obj.data.polygons)}f ({hits} hits"
-        if s.smooth_borders:
-            msg += f", {border_snapped} bordures snappées"
-        msg += ")"
-        self.report({'INFO'}, msg)
+        self.report({'INFO'}, f"{obj.name}: {len(obj.data.vertices)}v {len(obj.data.polygons)}f ({msg_extra})")
         return {'FINISHED'}
 
 
@@ -337,9 +380,23 @@ def _mesh_object_poll(self, obj):
 
 
 class SILH_settings(bpy.types.PropertyGroup):
+    mode: EnumProperty(
+        name="Mode",
+        items=[
+            ('RAYCAST', "Ray-cast grille", "Grille subdivisée + ray-cast (résolution réglable, peut générer un escalier sur les bords)"),
+            ('EXTRACT', "Extraire surface source", "Copie directe des faces du dessus de la cible (fidélité parfaite, pas d'escalier, mais hérite de la topologie source)"),
+        ],
+        default='RAYCAST',
+        description="Méthode de génération du plan",
+    )
+    normal_z_threshold: FloatProperty(
+        name="Seuil normal Z",
+        default=0.1, min=-1.0, max=1.0,
+        description="Garde les faces dont la normale Z dépasse ce seuil (0 = horizontal, 1 = vertical strict). 0.1 capture toutes les faces plutôt vers le haut.",
+    )
     target: PointerProperty(
         name="Cible",
-        description="Objet mesh à ray-caster",
+        description="Objet mesh source",
         type=bpy.types.Object,
         poll=_mesh_object_poll,
     )
@@ -411,35 +468,45 @@ class SILH_PT_panel(bpy.types.Panel):
         layout = self.layout
         s = context.scene.silhouette_settings
 
+        layout.prop(s, "mode", expand=True)
+
         box = layout.box()
         box.label(text="Cible")
         box.prop(s, "target", text="")
-        box.prop(s, "bounds_object", text="Limites XY")
 
-        box = layout.box()
-        box.label(text="Résolution grille")
-        row = box.row(align=True)
-        row.prop(s, "res_x")
-        row.prop(s, "res_y")
-        # Estimation faces
-        total = s.res_x * s.res_y
-        box.label(text=f"Verts grille: {total:,}", icon='INFO')
+        if s.mode == 'EXTRACT':
+            box = layout.box()
+            box.label(text="Extraction directe")
+            box.prop(s, "normal_z_threshold")
+            box.label(text="Aucune approximation, fidélité parfaite", icon='CHECKMARK')
+            box.label(text="Topologie héritée de la source", icon='ERROR')
+        else:
+            box = layout.box()
+            box.label(text="Cible")
+            box.prop(s, "bounds_object", text="Limites XY")
 
-        box = layout.box()
-        box.label(text="Ray-cast")
-        box.prop(s, "cast_height")
-        box.prop(s, "cast_distance")
+            box = layout.box()
+            box.label(text="Résolution grille")
+            row = box.row(align=True)
+            row.prop(s, "res_x")
+            row.prop(s, "res_y")
+            box.label(text=f"Verts grille: {s.res_x * s.res_y:,}", icon='INFO')
 
-        box = layout.box()
-        box.label(text="Lissage bordures (anti-escalier)")
-        box.prop(s, "smooth_borders")
-        sub = box.row()
-        sub.enabled = s.smooth_borders
-        sub.prop(s, "smooth_max_dist")
-        box.prop(s, "laplacian_iters")
-        sub2 = box.row()
-        sub2.enabled = s.laplacian_iters > 0
-        sub2.prop(s, "laplacian_factor")
+            box = layout.box()
+            box.label(text="Ray-cast")
+            box.prop(s, "cast_height")
+            box.prop(s, "cast_distance")
+
+            box = layout.box()
+            box.label(text="Lissage bordures (anti-escalier)")
+            box.prop(s, "smooth_borders")
+            sub = box.row()
+            sub.enabled = s.smooth_borders
+            sub.prop(s, "smooth_max_dist")
+            box.prop(s, "laplacian_iters")
+            sub2 = box.row()
+            sub2.enabled = s.laplacian_iters > 0
+            sub2.prop(s, "laplacian_factor")
 
         box = layout.box()
         box.label(text="Flancs (optionnel)")
